@@ -269,13 +269,6 @@ uses fresh artifacts.
 
 - **Resource limits**: every container runs with `--pids-limit 300
   --memory 8g` (override via `CLAW_PIDS_LIMIT` / `CLAW_CONTAINER_MEMORY`).
-- **ZeroClaw tool filter** (`claw_configs/zeroclaw/tool_filter_proxy.py`):
-  started automatically by the adapter on host port `18090`
-  (`ZEROCLAW_PROXY_PORT`), forwarding to `OPENROUTER_BASE_URL`, filtering
-  tools, and collecting usage in `/tmp/zc_proxy_usage.jsonl`
-  (`PROXY_USAGE_LOG`). The tracked ZeroClaw config points at
-  `host.docker.internal:18090`; keep it aligned if you change the port.
-  The legacy DashScope cache proxy has been removed.
 - **Instance lists**: `config/multilingual_300_instances.txt` and
   `config/verified_mini_50.txt` together form the 350-instance full set. The
   80-instance Lite subset is selected by the cost-aware, rank-aware procedure
