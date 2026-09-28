@@ -10,6 +10,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
+from claw_swebench.claws.base import decode_output
 from claw_swebench.secrets import render_config_dir
 
 DEFAULT_LOG_DIR = HERE / "logs" / "proposer_sessions"
@@ -86,7 +87,9 @@ def run(
         proc = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout_seconds)
         code, out, err = proc.returncode, proc.stdout, proc.stderr
     except subprocess.TimeoutExpired as e:
-        code, out, err = 124, (e.stdout or ""), (e.stderr or "") + f"\n[timeout after {timeout_seconds}s]"
+        code = 124
+        out = decode_output(e.stdout)
+        err = decode_output(e.stderr) + f"\n[timeout after {timeout_seconds}s]"
     dur = time.time() - t0
 
     sid = None

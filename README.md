@@ -248,6 +248,10 @@ table. Its only task set is `full350` (the two supplied instance lists).
 Outputs go to `jobs/`, `logs/`, `artifacts/`, and `agents/`; see
 `python3 metaharness/meta_harness.py --help` for concurrency, baseline reuse,
 and proposer limits.
+The `--run-name` namespaces benchmark and smoke artifact IDs as well as jobs
+and logs. Reuse the same name to resume benchmark instances, including on a
+later date; choose a new name for a separate experiment. Each smoke check
+uses fresh artifacts.
 
 ## Adding a new claw
 

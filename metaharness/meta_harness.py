@@ -12,6 +12,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import hermes_wrapper
@@ -255,11 +256,17 @@ def audit_task_specific(agent_dir, task_ids):
     return hits
 
 
+def _run_namespace():
+    namespace = os.path.relpath(JOBS_DIR, EVOLVE_DIR / "jobs")
+    label = re.sub(r"[^A-Za-z0-9_-]+", "-", namespace).strip("-")
+    digest = hashlib.sha256(namespace.encode()).hexdigest()[:12]
+    return f"{label}-{digest}"
+
+
 def swebench_run(agent_dir_name, job_name, task_set=EVAL_TASK_SET, n_concurrent=DEFAULT_CONCURRENCY,
                  eval_workers=DEFAULT_EVAL_WORKERS, instance_ids=None):
     job_dir = JOBS_DIR / job_name
     job_dir.mkdir(parents=True, exist_ok=True)
-    date = datetime.now().strftime("%Y%m%d")
     run_ids = []
     evals = []
     ok = True
@@ -269,7 +276,8 @@ def swebench_run(agent_dir_name, job_name, task_set=EVAL_TASK_SET, n_concurrent=
                          i in set((EVOLVE_DIR / inst_file).read_text().split())]
             if not split_ids:
                 continue
-        run_id = f"mh-gen-{job_name}-{tag}-{date}"
+        # The named evolution run owns these artifacts; retries resume across dates.
+        run_id = f"mh-gen-{_run_namespace()}-{job_name}-{tag}"
         run_ids.append(run_id)
         cmd = [sys.executable, "run_infer.py", "--claw", "generic", "--dataset", dataset, "--model", MODEL,
                "--llm_no", str(LLM_NO), "--candidate", str(AGENTS_DIR / agent_dir_name), "--run_id", run_id,
@@ -531,7 +539,8 @@ def smoke_test(name, agent_dir_name, timeout=AGENT_TIMEOUT + 600):
         shutil.rmtree(job_dir)
     job_dir.mkdir(parents=True)
     dataset, iid = SMOKE_TEST_TASK
-    run_id = f"mh-gen-{job_name}-{datetime.now().strftime('%Y%m%d')}"
+    # Smoke disables resume, so each invocation needs a new artifact directory.
+    run_id = f"mh-gen-{_run_namespace()}-{job_name}-{dataset}-{uuid4().hex}"
     t0 = time.time()
     result = run_cmd(
         [sys.executable, "run_infer.py", "--claw", "generic", "--dataset", dataset, "--model", MODEL,
@@ -553,13 +562,16 @@ def smoke_test(name, agent_dir_name, timeout=AGENT_TIMEOUT + 600):
 
     data = json.loads(result_file.read_text())
     agent = data.get("agent") or {}
-    if data.get("state") == "failed" or agent.get("exit_code") not in (0, None) or data.get("patch_empty"):
+    if (data.get("state") != "patch_collected" or data.get("patch_empty") is not False
+            or agent.get("success") is not True or agent.get("finish_reason") != "stop"
+            or agent.get("timeout")):
         print(f"  {_red('smoke FAIL')}: {name} (state={data.get('state')} exit={agent.get('exit_code')} "
               f"patch_empty={data.get('patch_empty')} err={str(data.get('error'))[:120]}, {_elapsed(elapsed)})")
         return False
 
     (job_dir / "job.json").write_text(json.dumps({"agent_dir": agent_dir_name, "run_ids": [run_id], "smoke": True}))
-    print(f"  {_green('smoke OK')}: {name} ({_elapsed(elapsed)}, state={data.get('state')})")
+    print(f"  {_green('smoke OK')}: {name} ({_elapsed(elapsed)}, state={data.get('state')} "
+          f"exit={agent.get('exit_code')})")
     return True
 
 
@@ -870,7 +882,8 @@ def main():
     parser.add_argument("--propose-timeout", type=int, default=3600, help="Timeout for proposer (seconds)")
     parser.add_argument("--propose-max-turns", type=int, default=300, help="Hermes max turns for the proposer")
     parser.add_argument("--run-name", type=str, default=None,
-                        help="Run name for isolated output dirs (jobs/<run>/*, logs/<run>/*). Auto-generated if not set.")
+                        help="Run name for isolated jobs, logs, and artifact IDs; reuse to resume across dates. "
+                             "Auto-generated if not set.")
     parser.add_argument("--fresh", action="store_true", help="Clear proposed agents and reset logs")
     parser.add_argument("--skip-baseline", action="store_true", help="Skip Phase 0 baseline eval")
     parser.add_argument("--import-baseline", type=str, default=None,
