@@ -1,9 +1,3 @@
-"""Run SWE-bench official harness evaluation.
-
-The swebench package is installed in a separate virtual environment
-(default /data/swe-bench-env, override via SWEBENCH_VENV env var),
-so we invoke it via subprocess.
-"""
 
 import logging
 import subprocess
@@ -18,34 +12,19 @@ logger = logging.getLogger(__name__)
 def run_evaluation(
     predictions_path: str | Path,
     dataset_name: str,
-    run_id: str = "claw-swe-bench",
+    run_id: str,
     instance_ids: list[str] | None = None,
     max_workers: int = 1,
     timeout: int = 1800,
 ) -> int:
-    """Run SWE-bench harness evaluation.
-
-    Args:
-        predictions_path: Path to predictions JSONL file.
-        dataset_name: Full dataset name (e.g. "princeton-nlp/SWE-bench_Verified").
-        run_id: Evaluation run identifier.
-        instance_ids: If provided, only evaluate these instances.
-        max_workers: Number of parallel evaluation workers.
-        timeout: Timeout per instance in seconds.
-
-    Returns:
-        Subprocess return code (0 = success).
-    """
     predictions_path = Path(predictions_path)
 
-    # Pre-validate
     errors = validate_prediction_file(predictions_path)
     if errors:
         for e in errors:
             logger.error("Prediction validation: %s", e)
         raise ValueError(f"Prediction file invalid: {len(errors)} error(s)")
 
-    # Build command
     python_bin = SWEBENCH_VENV / "bin" / "python"
     if not python_bin.exists():
         raise FileNotFoundError(
@@ -69,7 +48,7 @@ def run_evaluation(
 
     result = subprocess.run(
         cmd,
-        cwd=str(SWEBENCH_WORK_DIR),  # harness writes logs/ relative to cwd
+        cwd=str(SWEBENCH_WORK_DIR),
         text=True,
         capture_output=True,
         timeout=timeout * max(len(instance_ids or [1]), 1) * 5 + 300,

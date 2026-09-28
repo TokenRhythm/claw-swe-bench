@@ -1,4 +1,3 @@
-"""Shared data types used across modules."""
 
 from dataclasses import dataclass, field
 from enum import Enum
@@ -6,7 +5,6 @@ from pathlib import Path
 
 
 class InstanceState(str, Enum):
-    """Lifecycle state of a single SWE-bench instance."""
 
     PENDING = "pending"
     RUNNING = "running"
@@ -19,22 +17,20 @@ class InstanceState(str, Enum):
 
 @dataclass
 class AgentResult:
-    """Structured result from a single claw agent run."""
 
     success: bool
     timeout: bool
     exit_code: int
-    finish_reason: str  # "stop" / "timeout" / "error" / "empty"
+    finish_reason: str
     stdout_path: Path | None = None
     stderr_path: Path | None = None
     session_id: str | None = None
     duration_seconds: float = 0.0
-    usage: dict = field(default_factory=dict)  # token usage from agent meta
+    usage: dict = field(default_factory=dict)
 
 
 @dataclass
 class InstanceRecord:
-    """State record for a single instance, written to state.jsonl."""
 
     instance_id: str
     state: InstanceState

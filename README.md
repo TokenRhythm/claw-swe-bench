@@ -25,6 +25,7 @@ Supported claws:
 | `nanobot` | Python venv | bind-mount standalone Python + venv | `claw_configs/nanobot/config.json` |
 | `zeroclaw` | single Rust binary | bind-mount binary | `claw_configs/zeroclaw/config.toml` |
 | `generic` | Python repo ([lsdefine/GenericAgent](https://github.com/lsdefine/GenericAgent)) | bind-mount repo + venv | `--llm_no` index into `claw_configs/generic/mykey.py` |
+| `dsh` | Python venv (`deepseek_harness`) | bind-mount standalone Python + venv + supplied runner | `--model` + rendered provider patch |
 
 ## Design
 
@@ -46,14 +47,13 @@ run_eval.py  ──► official SWE-bench harness (separate venv)
 
 Key fairness/contamination properties, enforced for every claw:
 
-- **Same prompt.** All claws use `prompts/default.txt` (a phase-by-phase
-  long prompt). The only allowed override is tool-name guidance
-  (`prompts/generic.txt` adds 3 lines for GenericAgent's tool names and
-  bans its web tools; everything else is identical).
+- **Same prompt.** All supplied adapters use the shared `prompts/default.txt`,
+  containing the repository location, task constraints, and issue description.
 - **No network answers.** The prompt forbids network use; OpenClaw
   additionally gets a 13-tool deny list (web/memory/session/cron tools);
   NanoBot's web tools are disabled in config; ZeroClaw's traffic goes
-  through a tool-filtering proxy.
+  through a tool-filtering proxy. Container egress is locked by default to
+  the configured API domains (see *Configure the claw*).
 - **Future-commit stripping.** The official Multilingual images retain the
   fix commit in git history (`git log --all` leaks the gold patch). Every
   workspace strips future tags/commits, expires reflogs, and GCs before the
@@ -68,6 +68,8 @@ Key fairness/contamination properties, enforced for every claw:
 
 ### 1. Host requirements
 
+- A Linux host with Docker, `iptables`, and a configured `sniproxy-swe`
+  systemd service for the default network lock (details below).
 - Docker with prebuilt SWE-bench instance images
   (`sweb.eval.x86_64.<instance_id>:latest`, or SWE-agent's
   `swebench/sweb.eval.x86_64.<id>` naming — both are auto-detected).
@@ -83,12 +85,13 @@ eval containers. Defaults (all overridable via env vars, see
 
 | Env var | Default | Used by |
 |---|---|---|
-| `CLAW_PYTHON_HOME` | standalone Python 3.12 home (e.g. the `uv python install 3.12` location) | hermes, nanobot, generic |
+| `CLAW_PYTHON_HOME` | `/root/.local/share/uv/python/cpython-3.12.13-linux-x86_64-gnu` | hermes, nanobot, generic, dsh |
 | `OPENCLAW_NODE_BIN` / `OPENCLAW_MODULE_DIR` / `OPENCLAW_STATE_DIR` | `/usr/bin/node` / `/usr/lib/node_modules/openclaw` / `~/.openclaw` | openclaw |
 | `HERMES_ENV_PATH` | `/opt/hermes-env` | hermes |
 | `NANOBOT_ENV_PATH` | `/opt/nanobot-env` | nanobot |
 | `ZEROCLAW_BIN` | `/usr/local/bin/zeroclaw` | zeroclaw |
 | `GA_REPO_PATH` / `GA_ENV_PATH` | `/opt/genericagent` / `/opt/genericagent-env` | generic |
+| `DSH_ENV_PATH` | `/opt/dsh-env` (must provide `deepseek_harness`) | dsh |
 
 The standalone Python (`uv python install 3.12`) is required because the
 SWE-bench images don't ship a usable Python 3.12; the venvs must be created
@@ -96,20 +99,51 @@ with that interpreter so they run inside any container.
 
 ### 3. Configure the claw
 
-Copy the example config and fill in your API keys (real config files are
-gitignored):
+The tracked claw configs are templates. Set the host environment before
+running Hermes, NanoBot, ZeroClaw, GenericAgent, DSH, or the Meta-Harness
+proposer:
 
 ```bash
-cp claw_configs/hermes/config.yaml.example   claw_configs/hermes/config.yaml
-cp claw_configs/nanobot/config.json.example  claw_configs/nanobot/config.json
-cp claw_configs/zeroclaw/config.toml.example claw_configs/zeroclaw/config.toml
-cp claw_configs/generic/mykey.py.example     claw_configs/generic/mykey.py
+export OPENROUTER_API_KEY="your-api-key"
+export OPENROUTER_BASE_URL="https://openrouter.ai/api/v1"
 ```
 
-`hermes` and `generic` also read API keys from the host environment
-(`OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`,
-`DASHSCOPE_API_KEY`, …) — these are forwarded into the container
-automatically. OpenClaw uses its own credential store (`~/.openclaw`).
+`OPENROUTER_BASE_URL` is mandatory for those adapters and must be an absolute
+HTTP(S) URL including the API version path (for example, `/api/v1` for
+OpenRouter). Missing or invalid values raise a `RuntimeError`; no default
+API URL is inferred. Hermes and NanoBot receive the key and URL through rendered
+configs; DSH renders the URL into its runner patches and forwards the key.
+ZeroClaw renders its key and sends requests through the host tool-filter
+proxy, which uses this URL as its upstream. GenericAgent validates the URL
+and forwards both variables to its runtime, where `mykey.py` reads them.
+Only `OPENROUTER_API_KEY` is in the shared key-forwarding list. OpenClaw uses
+its own configured providers and credential store (`~/.openclaw`, or
+`OPENCLAW_STATE_DIR`); this adapter does not consume these two variables.
+
+Hermes, NanoBot, ZeroClaw, DSH, and the proposer substitute environment
+placeholders into `.rendered/<claw>/` at runtime; these directories contain
+credentials and are gitignored. GenericAgent reads its environment directly.
+Edit the tracked templates for model/provider settings where needed; do not
+put real credentials in them.
+
+By default, `SWE_NETWORK_WHITELIST=openrouter.ai` enables the Linux egress
+lock in `claw_swebench/netlock.py`. The runner creates the Docker bridge
+`swe-locked` (`SWE_NETLOCK_NETWORK`) with subnet `172.30.0.0/16`
+(`SWE_NETLOCK_SUBNET`), configures the `SWE-LOCK` iptables chain, and checks or
+starts the `sniproxy-swe` service. Run with host privileges that permit Docker,
+iptables, and systemd operations. Provision that service and its config at
+`/etc/sniproxy-swe/sniproxy.conf` yourself: the code does not create a missing
+proxy config or unit. Every comma-separated allowlisted domain must appear
+in the config's `table swe_allow`; restart `sniproxy-swe` after changing it.
+The containers use `--dns 127.0.0.1` and map allowlisted hosts to the bridge
+gateway, routing API traffic through the SNI proxy.
+
+For a custom API URL, add its hostname to both `SWE_NETWORK_WHITELIST` and
+`table swe_allow`, and configure the proxy route to that endpoint. Include
+any additional API hostnames required by OpenClaw's provider config. Setting
+`SWE_NETWORK_WHITELIST=off` (or an empty value) disables all of this runner's
+network control and leaves ordinary Docker networking; use that only when
+another mechanism supplies the isolation needed for your evaluation.
 
 ## Run
 
@@ -128,12 +162,21 @@ python3 run_infer.py \
 evaluations (also the built-in default — spelled out here so runs are
 reproducible even if defaults change).
 
-- `--claw {openclaw,hermes,nanobot,zeroclaw,generic}` — which harness.
+- `--claw {openclaw,hermes,nanobot,zeroclaw,generic,dsh}` — which harness.
 - `--dataset {verified,multilingual}` — loads `config/<dataset>.yaml`.
 - `--model`, `--timeout`, `--max_turns` — override per-claw defaults
   (`CLAW_DEFAULTS` in `config.py`). For nanobot/zeroclaw the model lives in
   the claw's own config file; `--model` is recorded as metadata.
-- `--llm_no N` — generic only: selects the Nth provider in `mykey.py`.
+- `--llm_no N` — generic only: selects the zero-based provider entry in
+  `mykey.py` (default `1`).
+- `--candidate PATH` — generic only: run a GenericAgent source tree, such as
+  `agents/task_completion_guard`, instead of `GA_REPO_PATH`.
+- `--reasoning_effort VALUE` — DSH only: forwarded to the supplied runner
+  (default `xhigh`). DSH uses the supplied model-specific provider patches;
+  its runner does not enforce `--max_turns`.
+- `--instance_ids ID ...` / `--instance_file PATH` — select a subset; when
+  both are supplied their IDs are combined. Evaluation accepts
+  `--instance_ids ID ...` as well.
 - `--workers N` — parallel instances (each in its own container).
 - Re-running the same `--run_id` resumes (skips completed instances);
   `--no_resume` disables that.
@@ -146,13 +189,65 @@ Artifacts land in `artifacts/<run_id>/`: per-instance `prompt.txt`,
 Evaluation (official harness):
 
 ```bash
+python3 run_eval.py --run_id openclaw-multi-1 --dataset multilingual
+```
+
+This reads `artifacts/<run_id>/predictions.jsonl` and resolves the dataset
+from `config/<dataset>.yaml`. The explicit prediction path and full dataset
+name remain available:
+
+```bash
 python3 run_eval.py \
     --predictions artifacts/openclaw-multi-1/predictions.jsonl \
     --dataset_name SWE-bench/SWE-bench_Multilingual \
     --run_id openclaw-multi-1
 ```
 
+A paired Hermes run on the Verified-Mini subset:
+
+```bash
+python3 run_infer.py \
+    --claw hermes --dataset verified --run_id hermes-vmini-1 \
+    --instance_file config/verified_mini_50.txt --timeout 3600
+python3 run_eval.py --run_id hermes-vmini-1 --dataset verified
+```
+
 Use a distinct `--run_id` per claw/run so harness logs don't collide.
+Evaluation uses `--max_workers` for parallelism; inference uses `--workers`.
+
+Optional Meta-Harness evolves GenericAgent source trees using a host Hermes
+proposer, validation/smoke checks, benchmark inference/evaluation, and a
+recorded frontier. It needs the installed GenericAgent tree (`GA_REPO_PATH`),
+a host `hermes` CLI, the API environment above, and the benchmark runtime.
+First build a seed and the provided `task_completion_guard` candidate:
+
+```bash
+python3 metaharness/seed.py
+python3 metaharness/seed.py --candidate task_completion_guard
+python3 run_infer.py \
+    --claw generic --candidate agents/task_completion_guard \
+    --dataset verified --run_id guard-vmini-1 \
+    --instance_file config/verified_mini_50.txt
+python3 run_eval.py --run_id guard-vmini-1 --dataset verified
+```
+
+`seed.py` copies the installed tree to `agents/baseline_generic` and applies
+`metaharness/task_completion_guard.diff` to create the candidate. Use
+`--force` to rebuild an existing seed/candidate. Generated `agents/` trees
+are gitignored. The outer loop runs real model calls and evaluations:
+
+```bash
+python3 metaharness/meta_harness.py \
+    --run-name generic-evolve-1 --iterations 5 --task-set full350
+```
+
+The current loop fixes its model/provider index and forces
+`SWE_NETWORK_WHITELIST=openrouter.ai` for benchmark subprocesses; a custom API
+host requires adjusting that loop configuration as well as the SNI allow
+table. Its only task set is `full350` (the two supplied instance lists).
+Outputs go to `jobs/`, `logs/`, `artifacts/`, and `agents/`; see
+`python3 metaharness/meta_harness.py --help` for concurrency, baseline reuse,
+and proposer limits.
 
 ## Adding a new claw
 
@@ -170,10 +265,13 @@ Use a distinct `--run_id` per claw/run so harness logs don't collide.
 
 - **Resource limits**: every container runs with `--pids-limit 300
   --memory 8g` (override via `CLAW_PIDS_LIMIT` / `CLAW_CONTAINER_MEMORY`).
-- **Proxies** (`proxies/`, `claw_configs/zeroclaw/tool_filter_proxy.py`):
-  optional host-side HTTP proxies for accurate cache/usage accounting on
-  providers that under-report it (e.g. DashScope `cached_tokens`). See the
-  file headers for details.
+- **ZeroClaw tool filter** (`claw_configs/zeroclaw/tool_filter_proxy.py`):
+  started automatically by the adapter on host port `18090`
+  (`ZEROCLAW_PROXY_PORT`), forwarding to `OPENROUTER_BASE_URL`, filtering
+  tools, and collecting usage in `/tmp/zc_proxy_usage.jsonl`
+  (`PROXY_USAGE_LOG`). The tracked ZeroClaw config points at
+  `host.docker.internal:18090`; keep it aligned if you change the port.
+  The legacy DashScope cache proxy has been removed.
 - **Instance lists**: `config/multilingual_300_instances.txt` and
   `config/verified_mini_50.txt` together form the 350-instance full set. The
   80-instance Lite subset is selected by the cost-aware, rank-aware procedure

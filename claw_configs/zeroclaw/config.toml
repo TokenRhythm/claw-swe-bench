@@ -1,0 +1,41 @@
+schema_version = 2
+
+[autonomy]
+level = "full"
+allowed_commands = ["*"]
+forbidden_paths = []
+workspace_only = false
+block_high_risk_commands = false
+require_approval_for_medium_risk = false
+max_actions_per_hour = 99999
+max_cost_per_day_cents = 999999
+shell_timeout_secs = 180
+
+[security]
+[security.sandbox]
+enabled = false
+
+[agent]
+max_tool_iterations = 300
+max_context_tokens = 204800
+
+[agent.thinking]
+default-level = "xhigh"
+
+[runtime]
+reasoning-effort = "xhigh"
+
+[pacing]
+loop_detection_enabled = false
+
+[providers]
+fallback = "custom:http://host.docker.internal:18090"
+
+[providers.models."custom:http://host.docker.internal:18090"]
+api_key = "${OPENROUTER_API_KEY}"
+model = "deepseek/deepseek-v4.1-flash"
+wire_api = "chat_completions"
+timeout_secs = 300
+
+[shell_tool]
+timeout_secs = 180

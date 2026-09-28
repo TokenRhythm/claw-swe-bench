@@ -1,0 +1,31 @@
+model:
+  default: "deepseek/deepseek-v4.1-flash"
+  provider: "openrouter"
+
+custom_providers:
+  - name: "openrouter"
+    base_url: "${OPENROUTER_BASE_URL}"
+    api_key: "${OPENROUTER_API_KEY}"
+    api_mode: "chat_completions"
+    context_length: 200000
+    models:
+      "deepseek/deepseek-v4.1-flash":
+        context_length: 1048576
+
+agent:
+  max_turns: 300
+  reasoning_effort: "xhigh"
+
+terminal:
+  backend: "local"
+  timeout: 180
+
+compression:
+  enabled: false
+
+approvals:
+  mode: "off"
+
+display:
+  show_reasoning: false
+  streaming: false
