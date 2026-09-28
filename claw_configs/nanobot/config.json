@@ -1,0 +1,23 @@
+{
+  "providers": {
+    "openrouter": {
+      "api_key": "${OPENROUTER_API_KEY}",
+      "api_base": "${OPENROUTER_BASE_URL}"
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": "deepseek/deepseek-v4.1-flash",
+      "provider": "openrouter",
+      "maxToolIterations": 300,
+      "context_window_tokens": 200000,
+      "reasoningEffort": "xhigh"
+    }
+  },
+  "tools": {
+    "web": {
+      "enable": false
+    },
+    "restrictToWorkspace": false
+  }
+}

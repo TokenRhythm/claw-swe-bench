@@ -1,16 +1,8 @@
-"""NanoBot CLI adapter for SWE-bench evaluation.
 
-Wraps `nanobot agent -m` CLI calls with structured result handling
-and timeout management.
-
-Architecture: NanoBot runs INSIDE the SWE-bench Docker container via
-bind-mounted standalone Python + nanobot venv. Model and provider are
-configured in claw_configs/nanobot/config.json (mounted read-only at
-/opt/nanobot-config).
-"""
-
+import json
 import logging
 import subprocess
+import re
 import time
 from pathlib import Path
 
@@ -22,39 +14,54 @@ from claw_swebench.config import (
     NANOBOT_SITE_PACKAGES,
 )
 from claw_swebench.claws.base import BaseClawAdapter, decode_output
+from claw_swebench.secrets import render_config_dir
 from claw_swebench.types import AgentResult
 
 logger = logging.getLogger(__name__)
 
-SUBPROCESS_TIMEOUT_BUFFER = 120
+USAGE_RE = re.compile(r"LLM usage: prompt=(\d+) completion=(\d+) cached=(\d+)")
 
-NANOBOT_CONFIG_DIR = CLAW_CONFIGS_DIR / "nanobot"
+SUBPROCESS_TIMEOUT_BUFFER = 120
 
 
 class NanoBotAdapter(BaseClawAdapter):
-    """Drives NanoBot CLI inside containers and returns structured results.
-
-    NanoBot runs inside the container via bind-mounted standalone Python
-    and nanobot venv. Each instance runs in its own container, so no
-    extra isolation is needed.
-    """
 
     name = "nanobot"
 
-    # ------------------------------------------------------------------
-    # Container integration
-    # ------------------------------------------------------------------
+    CONTEXT_WINDOW_TOKENS = 200_000
+
+    def __init__(self, model: str, timeout: int, max_turns: int | None = None):
+        super().__init__(model, timeout, max_turns)
+        self.config_dir = render_config_dir("nanobot")
+        cfg_path = self.config_dir / "config.json"
+        cfg = json.loads(cfg_path.read_text())
+        defaults = cfg.setdefault("agents", {}).setdefault("defaults", {})
+        defaults["context_window_tokens"] = self.CONTEXT_WINDOW_TOKENS
+        cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
+        logger.info("NanoBot config: model=%s context_window_tokens=%d",
+                    defaults.get("model"), self.CONTEXT_WINDOW_TOKENS)
+
 
     def container_run_args(self, instance_id: str) -> list[str]:
         return [
             "-v", f"{CLAW_PYTHON_HOME}:{CLAW_PYTHON_HOME}:ro",
             "-v", f"{NANOBOT_ENV_PATH}:{NANOBOT_ENV_PATH}:ro",
-            "-v", f"{NANOBOT_CONFIG_DIR}:/opt/nanobot-config",
+            "-v", f"{self.config_dir}:/opt/nanobot-config",
         ]
 
-    # ------------------------------------------------------------------
-    # Task execution
-    # ------------------------------------------------------------------
+
+    def collect_usage(self, workspace, artifact_dir: Path) -> dict:
+        log = artifact_dir / "agent_stderr.log"
+        if not log.exists():
+            return {}
+        prompt = completion = cached = calls = 0
+        for m in USAGE_RE.finditer(log.read_text(errors="replace")):
+            p, c, k = map(int, m.groups())
+            prompt += p; completion += c; cached += k; calls += 1
+        if not calls:
+            return {}
+        return {"input_tokens": prompt - cached, "cache_read_tokens": cached,
+                "output_tokens": completion, "api_calls": calls}
 
     def send_task(
         self,
@@ -70,8 +77,6 @@ class NanoBotAdapter(BaseClawAdapter):
         stdout_path = artifact_dir / "agent_stdout.log" if artifact_dir else None
         stderr_path = artifact_dir / "agent_stderr.log" if artifact_dir else None
 
-        # Build Python code to invoke nanobot CLI inside the container.
-        # NanoBot has no --model CLI flag, model is in config.json.
         nanobot_code = (
             "import sys; "
             f"sys.argv = ['nanobot', 'agent', '-m', {repr(prompt)}, "
@@ -115,13 +120,9 @@ class NanoBotAdapter(BaseClawAdapter):
 
         duration = time.time() - start_time
 
-        # Save session JSONL before cleanup (contains full conversation with tool calls).
         if artifact_dir:
             _save_session_jsonl(container_name, artifact_dir)
 
-        # Clean up NanoBot metadata files from /testbed before patch collection.
-        # NanoBot creates AGENTS.md, SOUL.md, etc. in the workspace (-w /testbed),
-        # which would pollute the git diff.
         _cleanup_nanobot_metadata(container_name)
 
         if stdout_path:
@@ -152,7 +153,6 @@ class NanoBotAdapter(BaseClawAdapter):
 
 
 def _save_session_jsonl(container_name: str, artifact_dir: Path) -> None:
-    """Copy NanoBot session JSONL from container before cleanup."""
     try:
         result = subprocess.run(
             ["docker", "exec", container_name, "cat",
@@ -166,7 +166,6 @@ def _save_session_jsonl(container_name: str, artifact_dir: Path) -> None:
 
 
 def _cleanup_nanobot_metadata(container_name: str) -> None:
-    """Remove NanoBot-created metadata files from /testbed before patch collection."""
     subprocess.run(
         ["docker", "exec", container_name, "bash", "-c",
          "cd /testbed && rm -rf "

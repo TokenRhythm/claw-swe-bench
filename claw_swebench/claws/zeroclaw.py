@@ -1,74 +1,60 @@
-"""ZeroClaw CLI adapter for SWE-bench evaluation.
-
-Wraps `zeroclaw agent -m` CLI calls with structured result handling
-and timeout management.
-
-Architecture: ZeroClaw runs INSIDE the SWE-bench Docker container via
-bind-mounted Rust binary (~37MB). Single binary, no runtime dependencies.
-Its config.toml is copied into the container's workspace dir after start.
-
-Usage accounting: ZeroClaw writes per-turn token usage to
-workspace/state/costs.jsonl inside the container. collect_usage() copies
-that file out, optionally merges cache/reasoning token info from a
-host-side proxy usage log (matched by time range + container IP), and
-computes cost_usd from a static pricing table.
-"""
 
 import json
 import logging
 import os
+import sys
+import socket
 import subprocess
 import time
 from pathlib import Path
 
-from claw_swebench.config import CLAW_CONFIGS_DIR, ZEROCLAW_BIN
+from claw_swebench.config import CLAW_CONFIGS_DIR, PROJECT_ROOT, ZEROCLAW_BIN
 from claw_swebench.claws.base import BaseClawAdapter, decode_output
+from claw_swebench.secrets import render_config_dir, require_openrouter_base_url
 from claw_swebench.types import AgentResult
 
 logger = logging.getLogger(__name__)
 
 SUBPROCESS_TIMEOUT_BUFFER = 120
 
-ZEROCLAW_CONFIG_DIR = CLAW_CONFIGS_DIR / "zeroclaw"
 
-# Host-side LLM proxy usage log (written by proxies/dashscope_cache_proxy.py
-# or claw_configs/zeroclaw/tool_filter_proxy.py). Optional.
-PROXY_USAGE_LOG = Path(os.environ.get("PROXY_USAGE_LOG", "/tmp/proxy_usage.jsonl"))
-
-# Static per-token pricing (USD). cost = fresh_input*input
-# + cache_read*cache_read + output*output.
-MODEL_PRICING = {
-    "z-ai/glm-5.1": {
-        "input": 0.00000098,
-        "output": 0.00000308,
-        "cache_read": 0.000000182,
-    },
-    "glm-5.1": {
-        "input": 0.00000098,
-        "output": 0.00000308,
-        "cache_read": 0.000000182,
-    },
-    # DashScope qwen3.6-flash (tier 1, single request <=256K input)
-    "qwen3.6-flash": {
-        "input": 0.000000181,
-        "output": 0.00000104,
-        "cache_read": 0.0000000361,
-    },
-}
+PROXY_USAGE_LOG = Path(os.environ.get("PROXY_USAGE_LOG", "/tmp/zc_proxy_usage.jsonl"))
+PROXY_PORT = int(os.environ.get("ZEROCLAW_PROXY_PORT", "18090"))
 
 
 class ZeroClawAdapter(BaseClawAdapter):
-    """Drives ZeroClaw CLI inside containers and returns structured results.
-
-    ZeroClaw is a single Rust binary, bind-mounted into the container.
-    Each instance runs in its own container with its own workspace dir.
-    """
 
     name = "zeroclaw"
 
-    # ------------------------------------------------------------------
-    # Container integration
-    # ------------------------------------------------------------------
+    def __init__(self, model: str, timeout: int, max_turns: int | None = None):
+        super().__init__(model, timeout, max_turns)
+        self.config_dir = render_config_dir("zeroclaw")
+        self._ensure_proxy()
+
+    @staticmethod
+    def _ensure_proxy():
+        upstream = require_openrouter_base_url()
+        with socket.socket() as sock:
+            sock.settimeout(1)
+            if sock.connect_ex(("127.0.0.1", PROXY_PORT)) == 0:
+                return
+        log_dir = PROJECT_ROOT / "logs"
+        log_dir.mkdir(exist_ok=True)
+        log = open(log_dir / "zeroclaw_proxy.log", "a")
+        subprocess.Popen(
+            [sys.executable, str(CLAW_CONFIGS_DIR / "zeroclaw" / "tool_filter_proxy.py"),
+             upstream, str(PROXY_PORT), str(PROXY_USAGE_LOG)],
+            stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+        )
+        for _ in range(20):
+            time.sleep(0.5)
+            with socket.socket() as sock:
+                sock.settimeout(1)
+                if sock.connect_ex(("127.0.0.1", PROXY_PORT)) == 0:
+                    logger.info("Started ZeroClaw tool-filter proxy on :%d", PROXY_PORT)
+                    return
+        raise RuntimeError(f"tool_filter_proxy did not come up on :{PROXY_PORT}; see logs/zeroclaw_proxy.log")
+
 
     def container_run_args(self, instance_id: str) -> list[str]:
         return [
@@ -76,28 +62,15 @@ class ZeroClawAdapter(BaseClawAdapter):
         ]
 
     def post_container_start(self, workspace) -> None:
-        """Copy config.toml into the container's workspace directory.
-
-        The tool-filtering proxy runs on the host (see
-        claw_configs/zeroclaw/tool_filter_proxy.py); config.toml points the
-        provider at host.docker.internal, which the workspace's --add-host
-        flag maps to the host gateway.
-        """
-        config_src = ZEROCLAW_CONFIG_DIR / "config.toml"
+        config_src = self.config_dir / "config.toml"
         if not config_src.exists():
-            logger.warning(
-                "ZeroClaw config not found at %s — copy config.toml.example "
-                "and fill in your provider settings.", config_src,
-            )
+            logger.warning("ZeroClaw config not found at %s", config_src)
             return
         workspace.run_in_container("mkdir -p /tmp/zeroclaw-workspace")
         workspace.copy_to_container(
             str(config_src), "/tmp/zeroclaw-workspace/config.toml"
         )
 
-    # ------------------------------------------------------------------
-    # Task execution
-    # ------------------------------------------------------------------
 
     def send_task(
         self,
@@ -171,12 +144,8 @@ class ZeroClawAdapter(BaseClawAdapter):
             usage={},
         )
 
-    # ------------------------------------------------------------------
-    # Usage accounting
-    # ------------------------------------------------------------------
 
     def collect_usage(self, workspace, artifact_dir: Path) -> dict:
-        """Copy costs.jsonl out of the container and compute token usage/cost."""
         workspace.copy_from_container(
             "/tmp/zeroclaw-workspace/workspace/state/costs.jsonl",
             str(artifact_dir / "costs.jsonl"),
@@ -185,32 +154,7 @@ class ZeroClawAdapter(BaseClawAdapter):
         return _parse_costs(artifact_dir, client_ip=container_ip, model=self.model)
 
 
-# ------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------
-
-
-def _compute_cost(model: str, input_tokens: int, output_tokens: int, cache_read_tokens: int) -> float:
-    """Compute cost in USD using static pricing table.
-
-        cost = (input_tokens - cache_read_tokens) * input_price
-             + cache_read_tokens * cache_read_price
-             + output_tokens * output_price
-    """
-    p = MODEL_PRICING.get(model)
-    if not p:
-        return 0.0
-    fresh_input = max(0, input_tokens - cache_read_tokens)
-    cost = (
-        fresh_input * p["input"]
-        + cache_read_tokens * p.get("cache_read", 0.0)
-        + output_tokens * p["output"]
-    )
-    return round(cost, 6)
-
-
 def _parse_proxy_usage(start_ts: str, end_ts: str, client_ip: str = "") -> dict:
-    """Extract cache/reasoning token info from proxy usage log by time range and client IP."""
     if not PROXY_USAGE_LOG.exists():
         return {}
     total_cache_read = 0
@@ -225,18 +169,14 @@ def _parse_proxy_usage(start_ts: str, end_ts: str, client_ip: str = "") -> dict:
                 ts = entry.get("timestamp", "")
                 if ts < start_ts or ts > end_ts:
                     continue
-                # Filter by client IP if provided (for parallel safety)
                 if client_ip and entry.get("client_ip", "") != client_ip:
                     continue
                 usage = entry.get("usage", {})
-                # Cache read: use prompt_cache_hit_tokens (DeepSeek)
-                # or prompt_tokens_details.cached_tokens — they are the same value, don't double count
                 cache_hit = usage.get("prompt_cache_hit_tokens", 0)
                 if not cache_hit:
                     cached_detail = usage.get("prompt_tokens_details", {})
                     cache_hit = cached_detail.get("cached_tokens", 0) if cached_detail else 0
                 total_cache_read += cache_hit
-                # Reasoning tokens
                 comp_detail = usage.get("completion_tokens_details", {})
                 if comp_detail:
                     total_reasoning += comp_detail.get("reasoning_tokens", 0)
@@ -251,11 +191,6 @@ def _parse_proxy_usage(start_ts: str, end_ts: str, client_ip: str = "") -> dict:
 
 
 def _parse_costs(artifact_dir: Path, client_ip: str = "", model: str = "") -> dict:
-    """Parse costs.jsonl to extract turns and token usage.
-
-    Merges cache/reasoning info from proxy usage log, then computes cost from
-    token counts using MODEL_PRICING (formula-based, not proxy-reported).
-    """
     costs_path = artifact_dir / "costs.jsonl"
     if not costs_path.exists():
         return {}
@@ -290,14 +225,7 @@ def _parse_costs(artifact_dir: Path, client_ip: str = "", model: str = "") -> di
         "output_tokens": total_output,
         "total_tokens": total_tokens,
     }
-    # Merge proxy usage data (cache_read, reasoning) by time range + client IP
     if first_ts and last_ts:
         proxy_data = _parse_proxy_usage(first_ts, last_ts, client_ip)
         result.update(proxy_data)
-    # Compute cost from token counts using static pricing table
-    if model and (total_input or total_output):
-        cache_read = result.get("cache_read_tokens", 0)
-        cost = _compute_cost(model, total_input, total_output, cache_read)
-        if cost > 0:
-            result["cost_usd"] = cost
     return result

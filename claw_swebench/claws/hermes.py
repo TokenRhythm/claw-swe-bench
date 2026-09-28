@@ -1,14 +1,6 @@
-"""Hermes Agent CLI adapter for SWE-bench evaluation.
-
-Wraps `hermes chat -q` CLI calls with structured result handling
-and timeout management.
-
-Architecture: Hermes runs INSIDE the SWE-bench Docker container via
-bind-mounted standalone Python + hermes venv. The agent directly
-operates on /testbed/ without docker exec in the prompt.
-"""
 
 import logging
+import sqlite3
 import os
 import subprocess
 import time
@@ -23,47 +15,34 @@ from claw_swebench.config import (
     HERMES_SITE_PACKAGES,
 )
 from claw_swebench.claws.base import BaseClawAdapter, decode_output
+from claw_swebench.secrets import render_config_dir
 from claw_swebench.types import AgentResult
 
 logger = logging.getLogger(__name__)
 
-# Extra buffer beyond agent timeout for subprocess.
 SUBPROCESS_TIMEOUT_BUFFER = 120
-
-HERMES_CONFIG_DIR = CLAW_CONFIGS_DIR / "hermes"
 
 
 class HermesAdapter(BaseClawAdapter):
-    """Drives Hermes Agent CLI inside containers and returns structured results.
-
-    Hermes runs inside the container via bind-mounted standalone Python
-    and hermes venv. Each invocation is stateless (--yolo).
-    """
 
     name = "hermes"
 
-    # ------------------------------------------------------------------
-    # Container integration
-    # ------------------------------------------------------------------
+    def __init__(self, model: str, timeout: int, max_turns: int | None = None):
+        super().__init__(model, timeout, max_turns)
+        self.config_dir = render_config_dir("hermes")
+
 
     def container_run_args(self, instance_id: str) -> list[str]:
         return [
             "-v", f"{CLAW_PYTHON_HOME}:{CLAW_PYTHON_HOME}:ro",
             "-v", f"{HERMES_ENV_PATH}:{HERMES_ENV_PATH}:ro",
-            "-v", f"{HERMES_CONFIG_DIR}:/opt/hermes-config:ro",
+            "-v", f"{self.config_dir}:/opt/hermes-config:ro",
         ]
 
     def post_container_start(self, workspace) -> None:
-        # HERMES_HOME doubles as Hermes' runtime state dir (auth.json,
-        # state.db, sessions/...), so it must live inside the throwaway
-        # container — pointing it at the host config dir would leak
-        # credentials and session logs onto the host.
-        config_path = HERMES_CONFIG_DIR / "config.yaml"
+        config_path = self.config_dir / "config.yaml"
         if not config_path.exists():
-            logger.warning(
-                "Hermes config not found at %s — copy config.yaml.example "
-                "and fill in your API keys.", config_path,
-            )
+            logger.warning("Hermes config not found at %s", config_path)
         r = workspace.run_in_container(
             "mkdir -p /tmp/hermes-home && "
             "cp /opt/hermes-config/config.yaml /tmp/hermes-home/config.yaml"
@@ -72,15 +51,30 @@ class HermesAdapter(BaseClawAdapter):
             logger.warning("Failed to provision HERMES_HOME: %s", r.stderr)
 
     def collect_usage(self, workspace, artifact_dir: Path) -> dict:
-        # Copy session logs out of the container before it is destroyed.
         workspace.copy_from_container(
             "/tmp/hermes-home/sessions", str(artifact_dir)
         )
-        return {}
+        db_path = artifact_dir / "state.db"
+        if not workspace.copy_from_container("/tmp/hermes-home/state.db", str(db_path)):
+            return {}
+        try:
+            con = sqlite3.connect(db_path)
+            row = con.execute(
+                "select sum(input_tokens), sum(output_tokens), sum(cache_read_tokens), "
+                "sum(cache_write_tokens), sum(api_call_count) from sessions"
+            ).fetchone()
+            con.close()
+        except sqlite3.Error as exc:
+            logger.warning("Could not read Hermes state.db: %s", exc)
+            return {}
+        return {
+            "input_tokens": row[0] or 0,
+            "output_tokens": row[1] or 0,
+            "cache_read_tokens": row[2] or 0,
+            "cache_write_tokens": row[3] or 0,
+            "api_calls": row[4] or 0,
+        }
 
-    # ------------------------------------------------------------------
-    # Task execution
-    # ------------------------------------------------------------------
 
     def send_task(
         self,
@@ -90,20 +84,12 @@ class HermesAdapter(BaseClawAdapter):
         artifact_dir: Path | None = None,
         instance_id: str | None = None,
     ) -> AgentResult:
-        """Send a task to Hermes Agent running inside a container."""
         if artifact_dir:
             artifact_dir.mkdir(parents=True, exist_ok=True)
 
         stdout_path = artifact_dir / "agent_stdout.log" if artifact_dir else None
         stderr_path = artifact_dir / "agent_stderr.log" if artifact_dir else None
 
-        # Build Python code to invoke hermes CLI inside the container.
-        # We can't use the hermes script directly (shebang path mismatch),
-        # so we import the entry point and call it.
-        # Don't pass --provider; let Hermes read default from config.yaml's
-        # `model.provider` field. For custom_providers (dashscope, infini-ai,
-        # deepseek), --provider arg is rejected by argparse since they're not
-        # in the built-in provider whitelist.
         hermes_code = (
             "import sys; "
             f"sys.argv = ['hermes', 'chat', '-q', {repr(prompt)}, "
@@ -120,7 +106,6 @@ class HermesAdapter(BaseClawAdapter):
             "-e", f"PYTHONPATH={HERMES_SITE_PACKAGES}",
             "-e", "HERMES_HOME=/tmp/hermes-home",
         ]
-        # Forward API key env vars into the container
         for env_name in API_KEY_ENV_VARS:
             val = os.environ.get(env_name)
             if val:
@@ -156,13 +141,11 @@ class HermesAdapter(BaseClawAdapter):
 
         duration = time.time() - start_time
 
-        # Save logs
         if stdout_path:
             stdout_path.write_text(stdout)
         if stderr_path:
             stderr_path.write_text(stderr)
 
-        # Hermes has no JSON output. Determine finish reason from exit code + output.
         if timed_out:
             finish_reason = "timeout"
         elif exit_code != 0:

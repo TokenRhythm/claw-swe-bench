@@ -1,11 +1,7 @@
-"""Claw adapter registry.
-
-Add a new claw by implementing BaseClawAdapter (see base.py) and
-registering the class here.
-"""
 
 from claw_swebench.config import CLAW_DEFAULTS
 from claw_swebench.claws.base import BaseClawAdapter
+from claw_swebench.claws.dsh import DSHAdapter
 from claw_swebench.claws.generic import GenericAgentAdapter
 from claw_swebench.claws.hermes import HermesAdapter
 from claw_swebench.claws.nanobot import NanoBotAdapter
@@ -18,6 +14,7 @@ CLAWS: dict[str, type[BaseClawAdapter]] = {
     "nanobot": NanoBotAdapter,
     "zeroclaw": ZeroClawAdapter,
     "generic": GenericAgentAdapter,
+    "dsh": DSHAdapter,
 }
 
 
@@ -27,8 +24,9 @@ def get_adapter(
     timeout: int | None = None,
     max_turns: int | None = None,
     llm_no: int | None = None,
+    candidate: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> BaseClawAdapter:
-    """Construct a claw adapter, filling unset arguments from CLAW_DEFAULTS."""
     if name not in CLAWS:
         raise ValueError(f"Unknown claw '{name}'. Available: {sorted(CLAWS)}")
 
@@ -40,5 +38,9 @@ def get_adapter(
     }
     if name == "generic":
         kwargs["llm_no"] = llm_no if llm_no is not None else defaults.get("llm_no", 0)
+        if candidate:
+            kwargs["candidate_dir"] = candidate
+    if name == "dsh" and reasoning_effort:
+        kwargs["reasoning_effort"] = reasoning_effort
 
     return CLAWS[name](**kwargs)

@@ -1,0 +1,2 @@
+# Preserve literal whitespace in the supplied candidate patch.
+metaharness/task_completion_guard.diff -whitespace

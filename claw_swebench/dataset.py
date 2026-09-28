@@ -1,4 +1,3 @@
-"""Load and filter SWE-bench datasets."""
 
 import logging
 from pathlib import Path
@@ -16,21 +15,6 @@ def load_instances(
     instance_ids: list[str] | None = None,
     instance_file: str | None = None,
 ) -> list[dict]:
-    """Load SWE-bench instances from HuggingFace, with optional filtering.
-
-    Args:
-        dataset_name: HuggingFace dataset name
-            (e.g. "princeton-nlp/SWE-bench_Verified").
-        split: Dataset split (default "test").
-        instance_ids: If provided, only keep these instance IDs.
-        instance_file: Path to a text file with one instance ID per line.
-            Merged with instance_ids if both are provided.
-
-    Returns:
-        List of instance dicts, each containing at least:
-        instance_id, repo, base_commit, problem_statement.
-    """
-    # Merge instance_ids from arguments and file
     filter_ids = set(instance_ids or [])
     if instance_file:
         path = Path(instance_file)

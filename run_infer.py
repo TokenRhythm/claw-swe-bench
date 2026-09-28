@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-"""Entry point: run any claw on SWE-bench instances to generate patches.
-
-One command, any claw:
-
-    python3 run_infer.py --claw openclaw --dataset multilingual --run_id oc-1
-    python3 run_infer.py --claw hermes   --dataset verified     --run_id hm-1 \
-        --instance_file config/verified_mini_50.txt
-"""
 
 import argparse
 import logging
@@ -68,6 +60,15 @@ def main():
         help="generic only: index into claw_configs/generic/mykey.py",
     )
     parser.add_argument(
+        "--candidate", default=None,
+        help="generic only: path to a GenericAgent source tree to run instead of the "
+             "installed one (Meta-Harness candidate, e.g. agents/<name>)",
+    )
+    parser.add_argument(
+        "--reasoning_effort", default=None,
+        help="dsh only: reasoning effort forwarded to the runner (default xhigh)",
+    )
+    parser.add_argument(
         "--workers", type=int, default=1,
         help="Number of parallel workers (default: 1 = sequential)",
     )
@@ -77,7 +78,6 @@ def main():
     )
     args = parser.parse_args()
 
-    # Load dataset config
     config_path = CONFIG_DIR / f"{args.dataset}.yaml"
     with open(config_path) as f:
         config = yaml.safe_load(f)
@@ -93,7 +93,6 @@ def main():
     logger.info("Config: claw=%s dataset=%s model=%s timeout=%ds gitignore=%s",
                 args.claw, dataset_name, model, timeout, setup_gitignore)
 
-    # Load dataset
     instances = load_instances(
         dataset_name=dataset_name,
         split=split,
@@ -106,16 +105,16 @@ def main():
 
     logger.info("Loaded %d instances to process.", len(instances))
 
-    # Create adapter
     adapter = get_adapter(
         args.claw,
         model=model,
         timeout=timeout,
         max_turns=args.max_turns,
         llm_no=args.llm_no,
+        candidate=args.candidate,
+        reasoning_effort=args.reasoning_effort,
     )
 
-    # Run
     records = run_batch(
         instances=instances,
         adapter=adapter,
@@ -126,7 +125,6 @@ def main():
         max_workers=args.workers,
     )
 
-    # Final report
     logger.info("=" * 60)
     logger.info("Run complete: %s", args.run_id)
     for r in records:

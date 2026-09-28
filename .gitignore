@@ -5,16 +5,22 @@ __pycache__/
 # Run outputs
 artifacts/
 logs/
+jobs/
+
+# Rendered claw configs (contain API keys substituted from the environment)
+.rendered/
 
 # GenericAgent per-instance runtime dirs
 ga_temp/
 ga_memory/
 
-# Real claw configs (contain API keys) — only *.example files are tracked
-claw_configs/hermes/config.yaml
-claw_configs/nanobot/config.json
-claw_configs/zeroclaw/config.toml
-claw_configs/generic/mykey.py
+# Meta-Harness agent trees (built by metaharness/seed.py)
+agents/
 
-# Internal pre-release review notes (contain key fragments)
+# Local environment and OS files
+.DS_Store
+.venv/
+.env
+
+# Internal pre-release review notes
 RELEASE_REVIEW.md
